@@ -1,15 +1,15 @@
 # Data directories
-kg
-no_verified_outputs
-other_old_outputs
-other_outputs
-old_old_outputs
-top3_outputs
-15_30_outputs
-annotations
-prompts
-results
-outputs
+kg/
+no_verified_outputs/
+other_old_outputs/
+other_outputs/
+old_old_outputs/
+top3_outputs/
+15_30_outputs/
+annotations/
+prompts/
+results/
+outputs/
 
 # API keys and sensitive files
 config.py
