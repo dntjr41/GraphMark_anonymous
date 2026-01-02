@@ -1,28 +1,26 @@
 # Data directories
-data
 kg
+no_verified_outputs
+other_old_outputs
+other_outputs
+old_old_outputs
+top3_outputs
+15_30_outputs
+annotations
+prompts
+results
 outputs
 
-# Large model files
-*.pkl
-*.json
-paragram_xxl.pkl
-paragram_xxl_words.json
-filtered_data_*.pkl
-wikitext_freq.json
-valid_wtmk_words_in_wiki_base-only-f1000.pkl
-
 # API keys and sensitive files
-*key*.txt
+config.py
 openai_key*.txt
 together_key.txt
-config.py
+roberta_stopwords.txt
 
-# Log files
-*.log
-nohup.out
-watermark.log
-subgraph_test.log
+# Python files
+extract_kg_embeddings.py
+print_tpr.py
+test_watermark_fix.py
 
 # Temporary files
 *.tmp
@@ -35,6 +33,7 @@ __pycache__/
 *.pyd
 .Python
 *.so
+.cache/
 
 # IDE files
 .vscode/

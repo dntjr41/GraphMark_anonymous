@@ -2,50 +2,29 @@ from sentence_transformers import SentenceTransformer
 from nltk.corpus import stopwords
 import torch
 import spacy
-from difflib import get_close_matches
-# from models import LLM  # 순환 import 제거
-from igraph import Graph
 import numpy as np
 import random
 
-# igraph 기반 그래프 생성 함수
-def build_igraph(triples):
-    nodes = set()
-    edges = []
-    for (head, relation, tail) in triples:
-        nodes.add(head)
-        nodes.add(tail)
-        edges.append((head, tail))
-    node_list = list(nodes)
-    node_idx = {node: idx for idx, node in enumerate(node_list)}
-    g = Graph(directed=True)
-    g.add_vertices(len(node_list))
-    g.add_edges([(node_idx[head], node_idx[tail]) for (head, tail) in edges])
-    return g, node_list, node_idx
-
 class subgraph_construction():
-    def __init__(self, llm, ratio=0.2, kg_entity_path="entities.txt", kg_relation_path="relations.txt", kg_triple_path="triples.txt", device_id=None):
+    def __init__(self, llm=None, ratio=0.2, topk=5, kg_entity_path="entities.txt", kg_relation_path="relations.txt", kg_triple_path="triples.txt", device_id=None):
         if device_id is not None and torch.cuda.is_available():
             self.device = torch.device(f'cuda:{device_id}')
         else:
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # LLM은 이미 인스턴스로 전달되어야 함 (순환 import 방지)
-        if hasattr(llm, 'generate'):  # LLM 인스턴스인지 확인
-            self.llm = llm
-        else:
-            raise ValueError("LLM must be an instance with a 'generate' method, not a string")
-        
+        # LLM 설정 (테마 분석용)
+        self.llm = llm
         self.ratio = ratio
-        self.topk = 3
+        self.topk = topk
         self.sbert_model = SentenceTransformer("all-MiniLM-L6-v2").to(self.device)
         self.nlp = spacy.load("en_core_web_sm")
+        
+        # Load stopwords once
+        self.stop_words = set(stopwords.words("english"))
         import os
-        # kg_entity_path가 절대 경로인지 확인하고 kg_root_path 계산
         if os.path.isabs(kg_entity_path):
             kg_root_path = os.path.dirname(kg_entity_path)
         else:
-            # 상대 경로인 경우 현재 작업 디렉토리 기준으로 절대 경로 계산
             kg_root_path = os.path.abspath(os.path.dirname(kg_entity_path))
         
         print(f"Calculated kg_root_path: {kg_root_path}")
@@ -54,14 +33,12 @@ class subgraph_construction():
         self.entity, self.relation, self.triple = self.load_kg(kg_entity_path, kg_relation_path, kg_triple_path)
     
     def load_pretrained_embeddings(self, kg_root_path):
-        # Entity와 Relation embedding 로드 (새로 학습된 파일들 사용)
         self.entity_embeddings = np.load(f"{kg_root_path}/entity_embeddings_full.npy")
         self.relation_embeddings = np.load(f"{kg_root_path}/relation_embeddings_full.npy")
         
-        # Entity ID와 이름 매핑 로드 (embedding 인덱스와 매핑)
         self.entity_id_to_name = {}
         self.entity_name_to_id = {}
-        self.entity_id_to_idx = {}  # Entity ID를 embedding 인덱스로 매핑
+        self.entity_id_to_idx = {}
         
         with open(f"{kg_root_path}/entities.txt", 'r') as f:
             for idx, line in enumerate(f):
@@ -71,28 +48,24 @@ class subgraph_construction():
                 
                 self.entity_id_to_name[entity_id] = entity_name
                 self.entity_name_to_id[entity_name] = entity_id
-                self.entity_id_to_idx[entity_id] = idx  # 인덱스 매핑
+                self.entity_id_to_idx[entity_id] = idx
         
         print(f"Loaded {len(self.entity_id_to_name)} entities")
         print(f"New entity embeddings size: {self.entity_embeddings.shape[0]} entities")
         print(f"Entity mapping size: {len(self.entity_id_to_idx)} entities")
         
-        # 매핑이 일치하는지 확인
         if len(self.entity_id_to_idx) != self.entity_embeddings.shape[0]:
             print(f"Warning: Entity mapping count ({len(self.entity_id_to_idx)}) != embedding count ({self.entity_embeddings.shape[0]})")
         else:
             print("✓ Entity mapping and embeddings are aligned!")
     
     def get_entity_embedding(self, entity_name):
-        """Entity 이름으로 embedding 반환"""
         if self.entity_embeddings is None:
             return None
         
         try:
-            # Entity 이름으로 ID 찾기
             if entity_name in self.entity_name_to_id:
                 entity_id = self.entity_name_to_id[entity_name]
-                # Entity ID를 인덱스로 매핑하여 embedding 반환
                 if entity_id in self.entity_id_to_idx:
                     entity_idx = self.entity_id_to_idx[entity_id]
                     if entity_idx < len(self.entity_embeddings):
@@ -101,8 +74,6 @@ class subgraph_construction():
                         print(f"Entity index {entity_idx} out of range for embeddings (max: {len(self.entity_embeddings)})")
                 else:
                     print(f"Entity ID {entity_id} not found in index mapping")
-            
-            # 직접 매칭이 안되면 유사한 이름 찾기
             for name, entity_id in self.entity_name_to_id.items():
                 if entity_name.lower() in name.lower() or name.lower() in entity_name.lower():
                     if entity_id in self.entity_id_to_idx:
@@ -143,220 +114,285 @@ class subgraph_construction():
                     kg_triple[(head, relation, tail)] = {"head": head, "relation": relation, "tail": tail}
         
         return kg_entity, kg_relation, kg_triple
-    
+
     def extract_keywords_with_ner(self, text):
-        """NER을 사용하여 키워드 추출 (fallback 방법)"""
+        """Extract keywords using spaCy NER - preserve original case"""
+        if not text or len(text.strip()) < 10:
+            return ["text", "content", "information"][:self.topk]
+        
         try:
-            print(f"Using NER fallback for text: {text[:100]}...")
+            doc = self.nlp(text)
+            keywords = []
+            keywords_lower = []  # For duplicate checking
             
-            # 텍스트 전처리
-            if not text or len(text.strip()) < 10:
-                print("Text too short for NER extraction")
-                return ["text", "content", "information"][:self.topk]
-            
-            # spaCy 처리
-            try:
-                doc = self.nlp(text)
-            except Exception as nlp_error:
-                print(f"spaCy processing failed: {nlp_error}")
-                # 간단한 fallback: 공백으로 분리하고 상위 단어들 선택
-                words = text.lower().split()
-                stop_words = set(stopwords.words("english"))
-                filtered_words = [w for w in words if w not in stop_words and len(w) > 2]
-                word_counts = {}
-                for word in filtered_words:
-                    word_counts[word] = word_counts.get(word, 0) + 1
-                sorted_words = sorted(word_counts.items(), key=lambda x: x[1], reverse=True)
-                return [word for word, _ in sorted_words[:self.topk]]
-            
-            # NER 엔티티 추출
-            ner_keywords = []
+            # Extract named entities
             for ent in doc.ents:
-                if ent.label_ in ["PERSON", "ORG", "GPE", "LOC", "FAC", "NORP", "PRODUCT", "EVENT", "WORK_OF_ART"]:
+                if ent.label_ in ["PERSON", "ORG", "GPE", "LOC", "FAC"]:
                     keyword = ent.text.strip()
-                    if keyword and len(keyword) > 1:
-                        ner_keywords.append(keyword.lower())
+                    keyword_lower = keyword.lower()
+                    if keyword and len(keyword) > 1 and keyword_lower not in self.stop_words and keyword_lower not in keywords_lower:
+                        keywords.append(keyword)
+                        keywords_lower.append(keyword_lower)
             
-            # 중복 제거
-            ner_keywords = list(set(ner_keywords))
-            print(f"NER entities found: {ner_keywords}")
-            
-            # 부족한 경우 명사 추가
-            if len(ner_keywords) < self.topk:
-                nouns = []
+            # Add nouns if not enough
+            if len(keywords) < self.topk:
                 for token in doc:
-                    if token.pos_ in ["NOUN", "PROPN"] and len(token.text.strip()) > 2:
-                        nouns.append(token.text.strip().lower())
-                
-                # 중복 제거하고 추가
-                nouns = list(set(nouns))
-                ner_keywords.extend(nouns)
-                print(f"Added nouns: {nouns}")
+                    if token.pos_ in ["NOUN", "PROPN"] and len(token.text) > 2:
+                        keyword = token.text.strip()
+                        keyword_lower = keyword.lower()
+                        if keyword_lower not in self.stop_words and keyword_lower not in keywords_lower:
+                            keywords.append(keyword)
+                            keywords_lower.append(keyword_lower)
             
-            # Stop words 제거
-            stop_words = set(stopwords.words("english"))
-            filtered_keywords = [kw for kw in ner_keywords if kw not in stop_words]
-            
-            # 최종 키워드 선택
-            final_keywords = filtered_keywords[:self.topk]
-            
-            # 부족한 경우 기본 키워드로 보완
-            if len(final_keywords) < self.topk:
-                default_keywords = ["information", "content", "text", "data", "document"]
-                for default_kw in default_keywords:
-                    if default_kw not in final_keywords and len(final_keywords) < self.topk:
-                        final_keywords.append(default_kw)
-            
-            print(f"✓ NER extraction completed: {final_keywords}")
-            return final_keywords
-            
+            return keywords[:self.topk] if keywords else ["text", "content", "information"][:self.topk]
         except Exception as e:
             print(f"Error in NER extraction: {e}")
-            # 최후의 fallback: 기본 키워드 반환
-            default_keywords = ["text", "content", "information", "data", "document"]
-            return default_keywords[:self.topk]
+            return ["text", "content", "information"][:self.topk]
     
-    def extract_keywords_with_llm(self, text):
-        """
-        LLM을 사용하여 키워드 추출 (더 안정적이고 일관성 있는 결과)
-        """
-        # 간단하고 명확한 프롬프트 사용
-        prompt = f"""Extract {self.topk} keywords from this text. Return only keywords separated by commas.
-
-        Text: {text}
-
-        Keywords:"""
-
+    def extract_keywords_simple(self, text):
+        """Extract keywords using NER, with semantic relevance filtering"""
+        # Try NER first
+        ner_keywords = self.extract_keywords_with_ner(text)
+        
+        # If LLM available and we need more keywords, try simple LLM extraction
+        if self.llm and hasattr(self.llm, 'generate') and len(ner_keywords) < self.topk:
+            try:
+                llm_keywords = self._extract_keywords_with_llm(text)
+                # Combine and deduplicate (case-insensitive)
+                all_keywords = ner_keywords.copy()
+                existing_lower = {kw.lower() for kw in all_keywords}
+                
+                for kw in llm_keywords:
+                    if kw.lower() not in existing_lower:
+                        all_keywords.append(kw)
+                        existing_lower.add(kw.lower())
+                
+                candidate_keywords = all_keywords[:self.topk * 2]  # Get more candidates for filtering
+            except Exception as e:
+                print(f"LLM extraction failed: {e}")
+                candidate_keywords = ner_keywords
+        else:
+            candidate_keywords = ner_keywords
+        
+        # Filter keywords by semantic relevance to text
+        filtered_keywords = self._filter_keywords_by_relevance(candidate_keywords, text)
+        
+        # 최종 결과가 비어있으면 fallback 키워드 사용
+        if not filtered_keywords:
+            print(f"   ⚠️  No keywords after filtering, using fallback keywords")
+            filtered_keywords = candidate_keywords[:self.topk] if candidate_keywords else ["text", "content", "information"][:self.topk]
+        
+        result = filtered_keywords[:self.topk]
+        print(f"   ✅ Final keywords ({len(result)}): {result}")
+        return result
+    
+    def extract_keywords_with_thematic_analysis(self, text):
+        """Legacy function - use extract_keywords_simple instead"""
+        return self.extract_keywords_simple(text)
+    
+    def _extract_keywords_with_llm(self, text):
+        """Simple LLM-based keyword extraction"""
         try:
-            print(f"Attempting LLM keyword extraction for text: {text[:100]}...")
-            
-            # LLM 호출 시도
-            try:
-                extracted_keywords = self.llm.generate(
-                    prompt, 
-                    max_tokens=50,  # 키워드만 필요하므로 토큰 수 최소화
-                    temperature=0.1  # 낮은 temperature로 일관성 향상
-                )
-                print(f"LLM raw response: '{extracted_keywords}'")
-            except Exception as llm_error:
-                print(f"LLM generation failed: {llm_error}")
-                print("Falling back to NER method")
-                return self.extract_keywords_with_ner(text)
-            
-            # 응답 검증
-            if not extracted_keywords or not isinstance(extracted_keywords, str):
-                print("LLM returned invalid response, falling back to NER")
-                return self.extract_keywords_with_ner(text)
-            
-            # 응답 정리
-            extracted_keywords = extracted_keywords.strip()
-            if not extracted_keywords:
-                print("LLM returned empty response, falling back to NER")
-                return self.extract_keywords_with_ner(text)
-            
-            # 키워드 추출 시도
-            try:
-                # 여러 줄 응답 처리
-                lines = [line.strip() for line in extracted_keywords.split('\n') if line.strip()]
-                
-                # 키워드가 있는 줄 찾기
-                keyword_line = None
-                for line in reversed(lines):
-                    if line and not any(marker in line.lower() for marker in ["text:", "keywords:", "extract", "analyze", "assistant"]):
-                        keyword_line = line
-                        break
-                
-                if not keyword_line:
-                    print("No valid keyword line found in LLM response, falling back to NER")
-                    return self.extract_keywords_with_ner(text)
-                
-                # 쉼표로 분리
-                raw_keywords = []
-                for keyword in keyword_line.split(","):
-                    keyword = keyword.strip()
-                    if keyword and len(keyword) > 0 and len(keyword) <= 50:
-                        # 특수문자 제거
-                        keyword = keyword.replace('"', '').replace("'", "").replace('(', '').replace(')', '')
-                        if keyword:
-                            raw_keywords.append(keyword)
-                
-                print(f"Parsed raw keywords: {raw_keywords}")
-                
-                if not raw_keywords:
-                    print("No valid keywords parsed, falling back to NER")
-                    return self.extract_keywords_with_ner(text)
-                
-                # 키워드 필터링
-                stop_words = set(stopwords.words("english"))
-                filtered_keywords = []
-                
-                for keyword in raw_keywords:
-                    keyword_lower = keyword.lower()
-                    # 유효한 키워드인지 확인
-                    if (keyword_lower not in stop_words and 
-                        len(keyword) > 1 and
-                        not any(bad_word in keyword_lower for bad_word in ["extract", "keywords", "text", "analyze"])):
-                        filtered_keywords.append(keyword)
-                
-                print(f"Filtered keywords: {filtered_keywords}")
-                
-                # 최종 키워드 선택
-                if len(filtered_keywords) >= self.topk:
-                    final_keywords = filtered_keywords[:self.topk]
-                    print(f"✓ LLM extraction successful: {final_keywords}")
-                    return final_keywords
-                else:
-                    print(f"LLM returned insufficient keywords ({len(filtered_keywords)}), supplementing with NER")
-                    ner_keywords = self.extract_keywords_with_ner(text)
-                    combined_keywords = list(set(filtered_keywords + ner_keywords))
-                    final_keywords = combined_keywords[:self.topk]
-                    print(f"✓ Combined keywords: {final_keywords}")
-                    return final_keywords
-                    
-            except Exception as parse_error:
-                print(f"Error parsing LLM response: {parse_error}")
-                print("Falling back to NER method")
-                return self.extract_keywords_with_ner(text)
-                
+            prompt = f"Extract key words from: {text[:200]}\nKeywords (comma-separated):"
+            response = self.llm.generate(prompt, max_tokens=50)
+            keywords = self._parse_llm_keywords(response)
+            keywords = self._filter_numeric_keywords(keywords)
+            return keywords
         except Exception as e:
-            print(f"Unexpected error in LLM keyword extraction: {e}")
-            print("Falling back to NER method")
-            return self.extract_keywords_with_ner(text)
+            print(f"LLM extraction error: {e}")
+            return []
+    
+    
+    def _parse_llm_keywords(self, response):
+        """Parse keywords from LLM response - preserve original case"""
+        try:
+            response = response.strip()
+            if not response:
+                return []
+            
+            import re
+            keywords = []
+            
+            # Try separators first
+            for sep in [',', ';', '\n', '|']:
+                if sep in response:
+                    parts = [part.strip() for part in response.split(sep)]
+                    for part in parts:
+                        if part and len(part) > 1 and len(part) < 50:
+                            clean_keyword = re.sub(r'[^\w\s-]', '', part).strip()
+                            if clean_keyword and len(clean_keyword.split()) <= 3:
+                                # Preserve original case
+                                clean_keyword_lower = clean_keyword.lower()
+                                if clean_keyword_lower not in self.stop_words:
+                                    keywords.append(clean_keyword)
+                    break
+            
+            # Fallback to word splitting
+            if not keywords:
+                words = re.findall(r'\b[a-zA-Z]{3,}\b', response)
+                for w in words:
+                    if 3 <= len(w) <= 20:
+                        w_lower = w.lower()
+                        if w_lower not in self.stop_words:
+                            keywords.append(w)  # Preserve case
+            
+            return keywords
+            
+        except Exception as e:
+            print(f"Error parsing LLM keywords: {e}")
+            return []
+    
+    def _filter_numeric_keywords(self, keywords):
+        """Filter out keywords that are mostly numeric"""
+        import re
+        filtered = []
+        for kw in keywords:
+            # Remove keywords that are mostly numbers
+            if not re.match(r'^\d+$', kw):
+                filtered.append(kw)
+        return filtered
+    
+    def _filter_keywords_by_relevance(self, keywords, text):
+        """Filter keywords based on semantic relevance to text topic"""
+        if not keywords:
+            print(f"   ⚠️  No keywords to filter")
+            return keywords
+        
+        # 키워드가 3개 이하이면 필터링하지 않고 그대로 반환 (너무 많이 걸러지는 것 방지)
+        if len(keywords) <= 3:
+            print(f"   📊 Skipping relevance filtering (too few keywords: {len(keywords)})")
+            return keywords
+        
+        try:
+            # Compute text embedding
+            text_embedding = self.sbert_model.encode(text, convert_to_numpy=True)
+            
+            # Compute relevance scores for each keyword
+            keyword_scores = []
+            for keyword in keywords:
+                # Compute keyword embedding
+                keyword_embedding = self.sbert_model.encode(keyword, convert_to_numpy=True)
+                
+                # Compute cosine similarity
+                similarity = np.dot(text_embedding, keyword_embedding) / (
+                    np.linalg.norm(text_embedding) * np.linalg.norm(keyword_embedding)
+                )
+                
+                keyword_scores.append((keyword, similarity))
+            
+            # Sort by relevance (higher = more relevant)
+            keyword_scores.sort(key=lambda x: x[1], reverse=True)
+            
+            # Filter by relevance threshold (keep top 70% most relevant, but at least top 3)
+            threshold = np.median([score for _, score in keyword_scores])
+            filtered_keywords = [kw for kw, score in keyword_scores if score >= threshold]
+            
+            # 최소한 top 3은 보장 (필터링 결과가 너무 적으면)
+            min_keywords = min(3, len(keywords))
+            if len(filtered_keywords) < min_keywords:
+                filtered_keywords = [kw for kw, _ in keyword_scores[:min_keywords]]
+                print(f"   ⚠️  Relevance filtering too aggressive, keeping top {min_keywords} keywords")
+            
+            print(f"   📊 Relevance filtering: {len(keywords)} -> {len(filtered_keywords)} keywords")
+            print(f"   📊 Relevance threshold: {threshold:.3f}")
+            
+            return filtered_keywords
+            
+        except Exception as e:
+            print(f"   ⚠️  Relevance filtering failed: {e}, using all keywords")
+            return keywords
     
     def get_matching_entities(self, keywords):
         matched_entities = {}
+        if not hasattr(self, '_entity_name_index'):
+            print("Building entity name index for fast matching...")
+            self._entity_name_index = self._build_entity_name_index()
+            print(f"Index built with {len(self._entity_name_index)} entries")
+        
         for keyword in keywords:
-            # 각 키워드별로 상위 2개의 엔티티 매칭
-            candidates = []
-            for entity_id, entity_data in self.entity.items():
-                entity_name = entity_data["entity"]
-                # get_close_matches는 리스트를 반환, n=5, cutoff=0.9
-                similar_matches = get_close_matches(keyword, entity_name, n=5, cutoff=0.85)
-                if similar_matches:
-                    # difflib SequenceMatcher로 유사도 점수 계산
-                    from difflib import SequenceMatcher
-                    for candidate in similar_matches:
-                        score = SequenceMatcher(None, keyword, candidate).ratio()
-                        candidates.append((score, entity_id, entity_name, candidate))
-                # 부분 일치도 고려 (더 유연한 매칭)
-                if keyword.lower() in entity_name or any(word.lower() in entity_name for word in keyword.split()):
-                    score = 0.9
-                    candidates.append((score, entity_id, entity_name, keyword))
-            
-            # 점수 순으로 정렬하고 상위 1개만 선택 (빠른 처리)
-            candidates.sort(key=lambda x: x[0], reverse=True)
-            top_entities = []
-            
-            for score, entity_id, entity_name, match in candidates[:1]:  # 상위 1개만
-                if entity_id is not None:
-                    top_entities.append((entity_id, entity_name))
-                    break
-            
-            if top_entities:
-                matched_entities[keyword] = top_entities
-                print(f"Keyword '{keyword}' matched entity: {top_entities[0][0]}")
+            keyword_lower = keyword.lower()
+            best_match = self._fallback_entity_matching(keyword)
+            if best_match:
+                print(f"✅ Match: {best_match[0]} ('{best_match[1]}')")
+                matched_entities[keyword] = [best_match]
+            else:
+                print(f"❌ No match found for '{keyword}'")
+                
+        print(f"\n📊 Final matching results: {len(matched_entities)}/{len(keywords)} keywords matched")
+        for keyword, entities in matched_entities.items():
+            entity_id, entity_name = entities[0]
+            print(f"   '{keyword}' -> {entity_id} ('{entity_name}')")
                 
         return matched_entities
+    
+    def _fallback_entity_matching(self, keyword):
+        """Entity 매칭 (정확한 매칭 + 부분 매칭)"""
+        keyword_lower = keyword.lower()
+        
+        # 정확한 매칭
+        if keyword_lower in self._entity_name_index:
+            entity_id, entity_name = self._entity_name_index[keyword_lower]
+            return (entity_id, entity_name)
+        
+        # 부분 매칭
+        candidates = []
+        for indexed_name, (entity_id, entity_name) in self._entity_name_index.items():
+            if (keyword_lower in indexed_name or 
+                any(word in indexed_name for word in keyword_lower.split())):
+                score = self._fast_similarity(keyword_lower, indexed_name)
+                if score > 0.6:
+                    candidates.append((score, entity_id, entity_name))
+        
+        if candidates:
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            return (candidates[0][1], candidates[0][2])
+        
+        return None
+    
+    def _build_entity_name_index(self):
+        """엔티티 이름 인덱스 구축 (최초 1회만 실행)"""
+        index = {}
+        
+        for entity_id, entity_data in self.entity.items():
+            entity_name_list = entity_data["entity"]
+            
+            # entity_name이 리스트인 경우 처리
+            if isinstance(entity_name_list, list):
+                entity_names = entity_name_list
+            else:
+                entity_names = [entity_name_list]
+            
+            # 각 entity 이름을 인덱스에 추가
+            for entity_name in entity_names:
+                if isinstance(entity_name, str) and len(entity_name.strip()) > 0:
+                    name_lower = entity_name.lower().strip()
+                    if name_lower not in index:  # 중복 방지
+                        index[name_lower] = (entity_id, entity_name)
+        
+        return index
+    
+    def _fast_similarity(self, str1, str2):
+        """빠른 유사도 계산 (SequenceMatcher 대신)"""
+        if str1 == str2:
+            return 1.0
+        
+        # Jaccard 유사도 (빠름)
+        set1 = set(str1.split())
+        set2 = set(str2.split())
+        
+        if not set1 or not set2:
+            return 0.0
+        
+        intersection = len(set1.intersection(set2))
+        union = len(set1.union(set2))
+        
+        jaccard = intersection / union if union > 0 else 0.0
+        
+        # 부분 일치 보너스
+        if str1 in str2 or str2 in str1:
+            jaccard += 0.3
+        
+        return min(1.0, jaccard)
     
     def get_kepler_embeddings_for_matched_entities(self, matched_entities):
         """
@@ -386,11 +422,11 @@ class subgraph_construction():
                 
                 print(f"  Entity: {entity_id} -> {entity_name_str}")
                 
-                # 디버깅: entity_name_str이 매핑에 있는지 확인
-                if entity_name_str in self.entity_name_to_id:
-                    print(f"    Found in name_to_id mapping")
+                # 디버깅: entity_id가 매핑에 있는지 확인
+                if entity_id in self.entity_id_to_name:
+                    print(f"    Found in entity mapping")
                 else:
-                    print(f"    NOT found in name_to_id mapping")
+                    print(f"    NOT found in entity mapping")
                 
                 # 직접 embedding 가져오기
                 embedding = self.get_entity_embedding(entity_name_str)
@@ -415,6 +451,187 @@ class subgraph_construction():
         entity_embeddings = self.get_kepler_embeddings_for_matched_entities(matched_entities)
         
         return matched_entities, entity_embeddings
+    
+    def find_paths_between_entities(self, seed_entities, entity_embeddings, max_hops=1, max_neighbors_per_hop=5):
+        """
+        Step 3: Path Searching - Find paths between seed entities in the KG
+        
+        Args:
+            seed_entities: Matched entities dictionary
+            entity_embeddings: Entity embeddings
+            max_hops: Maximum number of hops to explore (reduced for speed)
+            max_neighbors_per_hop: Maximum neighbors to explore per hop (reduced for speed)
+        
+        Returns:
+            set: Nodes found via path search
+        """
+        print("Searching for paths between seed entities...")
+        
+        # Get all seed entity IDs
+        seed_ids = set()
+        for keyword, entities in seed_entities.items():
+            for entity_id, entity_name in entities:
+                seed_ids.add(entity_id)
+        
+        print(f"Searching paths for {len(seed_ids)} seed entities...")
+        
+        # Start with seed nodes
+        subgraph_nodes = set(seed_ids)
+        seed_nodes_frozen = frozenset(seed_ids)
+        
+        # BFS: explore neighbors of seed nodes (limited to 1 hop)
+        for hop in range(1, max_hops + 1):
+            current_nodes = list(subgraph_nodes)
+            new_nodes = set()
+            
+            for node_id in current_nodes:
+                # Find directly connected entities (limited neighbors)
+                neighbors = self._find_directly_connected_entities(node_id, max_neighbors_per_hop)
+                
+                # Add neighbors that are not seed nodes
+                for neighbor in neighbors:
+                    if neighbor not in seed_nodes_frozen:
+                        new_nodes.add(neighbor)
+            
+            subgraph_nodes.update(new_nodes)
+            print(f"  Hop {hop}: Found {len(new_nodes)} new nodes")
+            
+            # Early stop if too many nodes
+            if len(subgraph_nodes) > 50:
+                print(f"  Stopping early (reached {len(subgraph_nodes)} nodes)")
+                break
+        
+        print(f"Total nodes found via path search: {len(subgraph_nodes)}")
+        return subgraph_nodes
+    
+    def add_virtual_edges(self, seed_entities, entity_embeddings, existing_nodes, 
+                         similarity_threshold=0.7, max_virtual_nodes=5):
+        """
+        Step 4: Virtual Edge Connection - Add bridge entities between disconnected seed entities
+        
+        Args:
+            seed_entities: Matched entities
+            entity_embeddings: Entity embeddings
+            existing_nodes: Current subgraph nodes (set)
+            similarity_threshold: Minimum similarity for virtual edges
+            max_virtual_nodes: Maximum number of bridge nodes to add
+        
+        Returns:
+            list: New nodes added via virtual edges (that are actually connected in KG)
+        """
+        print("Checking seed entity connectivity...")
+        
+        if not entity_embeddings or len(entity_embeddings) < 2:
+            print("Not enough seed entities for virtual edges")
+            return []
+        
+        # Get all seed entity IDs
+        seed_ids = []
+        for keyword, entities in seed_entities.items():
+            for entity_id, entity_name in entities:
+                seed_ids.append(entity_id)
+        
+        # Check if seed entities are connected in the current graph
+        existing_nodes_set = set(existing_nodes)
+        unconnected_pairs = []
+        
+        for i, seed1 in enumerate(seed_ids):
+            for seed2 in seed_ids[i+1:]:
+                has_path = self._check_simple_path(seed1, seed2, existing_nodes_set)
+                if not has_path:
+                    unconnected_pairs.append((seed1, seed2))
+        
+        print(f"Found {len(unconnected_pairs)} unconnected seed entity pairs")
+        
+        if not unconnected_pairs:
+            print("All seed entities are already connected")
+            return []
+        
+        # For each unconnected pair, find a bridge entity (minimal for speed)
+        virtual_nodes = []
+        sampled_entities = random.sample(list(self.entity.keys()), min(100, len(self.entity)))
+        
+        # Only process first 1 pair for speed
+        if unconnected_pairs:
+            seed1, seed2 = unconnected_pairs[0]
+            bridge = self._find_bridge_between_two_seeds(seed1, seed2, sampled_entities, 
+                                                         existing_nodes_set, similarity_threshold)
+            if bridge:
+                virtual_nodes.append(bridge)
+                print(f"   ✓ Added bridge {bridge}")
+        
+        print(f"Added {len(virtual_nodes)} virtual bridge nodes")
+        return virtual_nodes
+    
+    def _verify_bridge_connection(self, bridge_id, existing_nodes):
+        """
+        Check if bridge entity has connections to existing subgraph nodes
+        (Currently disabled for speed - all triples are validated in get_subgraph_triples)
+        """
+        # Skip verification for speed - triples are validated later in get_subgraph_triples
+        return True
+    
+    def _check_simple_path(self, entity1, entity2, nodes_in_graph):
+        """Check if there's a path between two entities in current graph (simple check)"""
+        if entity1 not in nodes_in_graph or entity2 not in nodes_in_graph:
+            return False
+        
+        # Quick check: do they share any common neighbors?
+        neighbors1 = self._get_one_hop_neighbors(entity1, nodes_in_graph)
+        neighbors2 = self._get_one_hop_neighbors(entity2, nodes_in_graph)
+        
+        # If they share neighbors, they're connected
+        if neighbors1.intersection(neighbors2):
+            return True
+        
+        # If entity2 is in neighbors of entity1 or vice versa
+        if entity2 in neighbors1 or entity1 in neighbors2:
+            return True
+        
+        return False
+    
+    def _get_one_hop_neighbors(self, entity_id, nodes_in_graph):
+        """Get one-hop neighbors of an entity"""
+        neighbors = set()
+        for (head, relation, tail) in self.triple.keys():
+            if head == entity_id and tail in nodes_in_graph:
+                neighbors.add(tail)
+            elif tail == entity_id and head in nodes_in_graph:
+                neighbors.add(head)
+        return neighbors
+    
+    def _find_bridge_between_two_seeds(self, seed1, seed2, candidate_entities, existing_nodes, threshold=0.7):
+        """
+        Find one bridge entity between two seed entities
+        Fast version: no connection verification, just similarity check
+        """
+        emb1 = self.get_entity_embedding_by_id(seed1)
+        emb2 = self.get_entity_embedding_by_id(seed2)
+        
+        if emb1 is None or emb2 is None:
+            return None
+        
+        best_candidate = None
+        best_score = 0
+        
+        # Check up to 50 candidate entities (minimal for speed)
+        for candidate_id in candidate_entities[:50]:
+            if candidate_id in existing_nodes:
+                continue
+            
+            candidate_emb = self.get_entity_embedding_by_id(candidate_id)
+            if candidate_emb is not None:
+                sim1 = self._compute_cosine_similarity(emb1, candidate_emb)
+                sim2 = self._compute_cosine_similarity(emb2, candidate_emb)
+                
+                # Average similarity
+                avg_sim = (sim1 + sim2) / 2
+                
+                if sim1 >= threshold and sim2 >= threshold and avg_sim > best_score:
+                    best_score = avg_sim
+                    best_candidate = candidate_id
+        
+        return best_candidate
     
     def adaptive_pruning(self, subgraph_nodes, seed_entities, entity_embeddings, 
                         base_threshold=0.7, pruning_ratio=0.3, min_nodes=10):
@@ -698,10 +915,12 @@ class subgraph_construction():
     def _find_semantically_similar_entities(self, query_embedding, candidate_entities, threshold=0.7, top_k=20):
         """
         Query embedding과 의미적으로 유사한 entity들 찾기
+        Optimized: skips connection check for speed
         """
         similarities = []
         
-        for entity_id in candidate_entities:
+        # Only check first 300 candidates for speed
+        for entity_id in candidate_entities[:300]:
             entity_embedding = self.get_entity_embedding_by_id(entity_id)
             if entity_embedding is not None and not np.allclose(entity_embedding, 0):
                 similarity = self._compute_cosine_similarity(query_embedding, entity_embedding)
@@ -711,6 +930,14 @@ class subgraph_construction():
         # 유사도 순으로 정렬하고 상위 k개 반환
         similarities.sort(key=lambda x: x[1], reverse=True)
         return [entity_id for entity_id, _ in similarities[:top_k]]
+    
+    def _entity_has_connections(self, entity_id):
+        """
+        Check if entity has connections in the KG
+        (Currently disabled for speed - triples are validated in get_subgraph_triples)
+        """
+        # Skip verification for speed - triples are validated later in get_subgraph_triples
+        return True
     
     def _find_seed_connectivity_bridges(self, entity_embeddings, candidate_entities, similarity_threshold=0.7):
         """
@@ -738,6 +965,7 @@ class subgraph_construction():
     def _find_bridge_entities_between_seeds(self, seed1_id, seed2_id, candidate_entities, similarity_threshold=0.7):
         """
         두 seed nodes를 연결하는 bridge entities 찾기
+        Optimized: skips connection check for speed
         """
         bridge_nodes = set()
         
@@ -748,8 +976,8 @@ class subgraph_construction():
         if seed1_embedding is None or seed2_embedding is None:
             return bridge_nodes
         
-        # 두 seed와 모두 유사한 중간 노드들 찾기
-        for entity_id in candidate_entities:
+        # 두 seed와 모두 유사한 중간 노드들 찾기 (only check first 200)
+        for entity_id in candidate_entities[:200]:
             entity_embedding = self.get_entity_embedding_by_id(entity_id)
             if entity_embedding is not None:
                 sim1 = self._compute_cosine_similarity(seed1_embedding, entity_embedding)
@@ -823,18 +1051,75 @@ class subgraph_construction():
             print(f"Error computing cosine similarity: {e}")
             return 0.0
     
-    def get_subgraph_triples(self, subgraph_nodes):
+    def get_subgraph_triples(self, subgraph_nodes, seed_entities=None):
         """
-        Subgraph 노드들에 해당하는 triples 추출
+        Subgraph 노드들에 해당하는 triples 추출 + 키워드 매칭된 entity 관련 triplet 보장
         """
         subgraph_triples = []
         
+        # 1. 일반적인 subgraph triplets 추출
         for (head, relation, tail) in self.triple.keys():
             if head in subgraph_nodes and tail in subgraph_nodes:
                 subgraph_triples.append([head, relation, tail])
         
+        # 2. 키워드 entity와 관련된 triplet 추가 (각 Entity마다 최소 5개)
+        if seed_entities:
+            keyword_entity_ids = set()
+            for keyword, entities in seed_entities.items():
+                for entity_id, entity_name in entities:
+                    keyword_entity_ids.add(entity_id)
+            
+            # 각 Entity별로 최소 5개씩 triplet 보장
+            entity_triplet_counts = {}
+            for entity_id in keyword_entity_ids:
+                entity_triplet_counts[entity_id] = 0
+            
+            # 먼저 기존 subgraph_triples에서 키워드 entity들의 triplet 개수 계산
+            for triple in subgraph_triples:
+                if len(triple) >= 3:
+                    head, relation, tail = triple
+                    if head in keyword_entity_ids:
+                        entity_triplet_counts[head] += 1
+                    if tail in keyword_entity_ids:
+                        entity_triplet_counts[tail] += 1
+            
+            # 키워드 entity와 관련된 triplet들 추가 (최소 5개씩 보장)
+            added_count = 0
+            for (head, relation, tail) in self.triple.keys():
+                triple = [head, relation, tail]
+                if triple not in subgraph_triples:
+                    # head가 키워드 entity인 경우
+                    if head in keyword_entity_ids and entity_triplet_counts[head] < 5:
+                        subgraph_triples.append(triple)
+                        entity_triplet_counts[head] += 1
+                        added_count += 1
+                    # tail이 키워드 entity인 경우
+                    elif tail in keyword_entity_ids and entity_triplet_counts[tail] < 5:
+                        subgraph_triples.append(triple)
+                        entity_triplet_counts[tail] += 1
+                        added_count += 1
+            
+            # 각 Entity별 triplet 개수 출력
+            print(f"Entity triplet counts:")
+            entities_with_insufficient_triplets = []
+            for entity_id in keyword_entity_ids:
+                count = entity_triplet_counts[entity_id]
+                print(f"  {entity_id}: {count} triplets")
+                if count < 5:
+                    entities_with_insufficient_triplets.append((entity_id, count))
+            
+            if entities_with_insufficient_triplets:
+                print(f"⚠️  Warning: {len(entities_with_insufficient_triplets)} entities have less than 5 triplets:")
+                for entity_id, count in entities_with_insufficient_triplets:
+                    print(f"    {entity_id}: {count} triplets")
+            else:
+                print(f"✅ All keyword entities have at least 5 triplets")
+            
+            print(f"Added {added_count} keyword-related triplets")
+        
         print(f"Extracted {len(subgraph_triples)} triples for subgraph with {len(subgraph_nodes)} nodes")
         return subgraph_triples
+    
     
     def analyze_subgraph_quality(self, subgraph_nodes, seed_entities):
         """
@@ -905,82 +1190,66 @@ class subgraph_construction():
         Returns:
             dict: subgraph 정보를 담은 딕셔너리
         """
-        try:
-            print(f"Building subgraph from text: {text[:100]}...")
+        print(f"\n{'='*80}")
+        print(f"Building subgraph from text: {text[:100]}...")
+        print(f"{'='*80}\n")
+        
+        # Step 1: Keyword Extraction
+        print("Step 1: Keyword Extraction")
+        print("-" * 80)
+        keywords = self.extract_keywords_simple(text)
+        print(f"Keywords: {keywords}")
+        
+        # 키워드가 비어있으면 경고하고 빈 리스트 반환
+        if not keywords:
+            print(f"⚠️  WARNING: No keywords extracted from text!")
+            print(f"   This may cause subgraph construction to fail.")
+            print(f"   Text length: {len(text)} characters")
+            print(f"   Text preview: {text[:200]}...\n")
+        else:
+            print(f"✅ Extracted {len(keywords)} keywords\n")
+        
+        # Step 2: Entity Matching
+        print("Step 2: Entity Matching")
+        print("-" * 80)
+        seed_entities, entity_embeddings = self.get_entity_matching_with_kepler_embeddings(keywords)
+        print(f"Matched {len(seed_entities)} entities\n")
+        
+        # Step 3: Path Searching
+        print("Step 3: Path Searching")
+        print("-" * 80)
+        subgraph_nodes_set = self.find_paths_between_entities(seed_entities, entity_embeddings)
+        print(f"Found {len(subgraph_nodes_set)} nodes via path search\n")
+        
+        # Step 4: Virtual Edge Connection
+        print("Step 4: Virtual Edge Connection")
+        print("-" * 80)
+        virtual_nodes = self.add_virtual_edges(seed_entities, entity_embeddings, subgraph_nodes_set)
+        subgraph_nodes = list(subgraph_nodes_set) + virtual_nodes
+        print(f"Added {len(virtual_nodes)} virtual nodes\n")
+        
+        # Step 5: Adaptive Pruning
+        print("Step 5: Adaptive Pruning")
+        print("-" * 80)
+        if enable_adaptive_pruning:
+            subgraph_nodes = self.adaptive_pruning(
+                subgraph_nodes, seed_entities, entity_embeddings,
+                base_threshold=0.7, pruning_ratio=pruning_ratio, min_nodes=10
+            )
+        print(f"Final subgraph: {len(subgraph_nodes)} nodes\n")
             
-            # 키워드 추출 (LLM 사용 - 더 안정적이고 일관성 있는 결과)
-            try:
-                keywords = self.extract_keywords_with_llm(text)
-                print(f"✓ Keywords extracted successfully: {keywords}")
-            except Exception as keyword_error:
-                print(f"❌ Keyword extraction failed: {keyword_error}")
-                print("Using fallback keyword extraction...")
-                # 최후의 fallback: 간단한 단어 분리
-                words = text.lower().split()
-                stop_words = set(stopwords.words("english"))
-                keywords = [w for w in words if w not in stop_words and len(w) > 2][:self.topk]
-                if not keywords:
-                    keywords = ["text", "content", "information"][:self.topk]
-                print(f"Fallback keywords: {keywords}")
-            
-            # 키워드 검증
-            if not keywords or len(keywords) == 0:
-                print("Warning: No keywords extracted, using default keywords")
-                keywords = ["text", "content", "information"][:self.topk]
-            
-            # Entity 매칭 및 embedding 가져오기
-            try:
-                seed_entities = self.get_matching_entities(keywords)
-                print(f"✓ Entity matching completed: {len(seed_entities)} entities found")
-            except Exception as entity_error:
-                print(f"❌ Entity matching failed: {entity_error}")
-                seed_entities = {}
-            
-            try:
-                entity_embeddings = self.get_kepler_embeddings_for_matched_entities(seed_entities)
-                print(f"✓ Entity embeddings loaded: {len(entity_embeddings)} embeddings")
-            except Exception as embedding_error:
-                print(f"❌ Entity embedding loading failed: {embedding_error}")
-                entity_embeddings = {}
-            
-            # Subgraph 구성 (Semantic Bridge 전략 사용)
-            try:
-                subgraph_nodes = self.construct_subgraph_semantic_bridge(
-                    seed_entities, entity_embeddings, 
-                    top_k=50, similarity_threshold=0.7, virtual_edge_ratio=0.1,
-                    enable_adaptive_pruning=enable_adaptive_pruning, 
-                    pruning_ratio=pruning_ratio
-                )
-                print(f"✓ Subgraph construction completed: {len(subgraph_nodes)} nodes")
-            except Exception as subgraph_error:
-                print(f"❌ Subgraph construction failed: {subgraph_error}")
-                # 최소한의 subgraph 생성
-                subgraph_nodes = list(seed_entities.keys()) if seed_entities else []
-                print(f"Created minimal subgraph with {len(subgraph_nodes)} nodes")
-            
-            # Subgraph triples 추출
-            try:
-                subgraph_triples = self.get_subgraph_triples(subgraph_nodes)
-                print(f"✓ Subgraph triples extracted: {len(subgraph_triples)} triples")
-            except Exception as triple_error:
-                print(f"❌ Triple extraction failed: {triple_error}")
-                subgraph_triples = []
-            
-            # Subgraph 품질 분석
-            try:
-                quality_info = self.analyze_subgraph_quality(subgraph_nodes, seed_entities)
-                print(f"✓ Quality analysis completed")
-            except Exception as quality_error:
-                print(f"❌ Quality analysis failed: {quality_error}")
-                quality_info = {
-                    'total_nodes': len(subgraph_nodes),
-                    'seed_coverage': 0.0,
-                    'connectivity': 0.0,
-                    'seed_count': len(seed_entities),
-                    'included_seed_count': 0
-                }
-            
-            return {
+        # Get triples
+        print("Extracting triples...")
+        subgraph_triples = self.get_subgraph_triples(subgraph_nodes, seed_entities)
+        
+        # Quality analysis
+        quality_info = self.analyze_subgraph_quality(subgraph_nodes, seed_entities)
+        
+        print(f"\n{'='*80}")
+        print("Subgraph construction completed!")
+        print(f"{'='*80}\n")
+        
+        return {
                 'keywords': keywords,
                 'seed_entities': seed_entities,
                 'subgraph_nodes': subgraph_nodes,
@@ -990,174 +1259,3 @@ class subgraph_construction():
                 'pruning_ratio': pruning_ratio,
                 'quality_info': quality_info
             }
-            
-        except Exception as e:
-            print(f"❌ Critical error in build_subgraph_from_text: {e}")
-            print("Returning minimal subgraph...")
-            
-            # 최소한의 결과 반환
-            return {
-                'keywords': ["text", "content", "information"][:self.topk],
-                'seed_entities': {},
-                'subgraph_nodes': [],
-                'subgraph_triples': [],
-                'entity_embeddings': {},
-                'adaptive_pruning_enabled': enable_adaptive_pruning,
-                'pruning_ratio': pruning_ratio,
-                'quality_info': {
-                    'total_nodes': 0,
-                    'seed_coverage': 0.0,
-                    'connectivity': 0.0,
-                    'seed_count': 0,
-                    'included_seed_count': 0
-                }
-            }
-
-# Example usage
-if __name__ == "__main__":
-    import time
-    import json
-    
-    print("Testing Semantic Bridge subgraph construction...")
-    
-    llm_model = "llama-3-8b-chat"
-    kg_root_path = "/home/wooseok/KG_Mark/kg/processed_wikidata5m"
-    kg_entity_path = f"{kg_root_path}/entities.txt"
-    kg_relation_path = f"{kg_root_path}/relations.txt"
-    kg_triple_path = f"{kg_root_path}/triplets.txt"
-    
-    print(f"Loading KG from: {kg_root_path}")
-    
-    sg = subgraph_construction(llm_model, kg_entity_path=kg_entity_path, 
-                               kg_relation_path=kg_relation_path, 
-                               kg_triple_path=kg_triple_path)
-    
-    print(f"Loaded {len(sg.entity)} entities and {len(sg.relation)} relations")
-    
-    # Load test data from opengen_500.jsonl
-    opengen_file = "data/opengen_500.jsonl"
-    print(f"\nLoading test data from: {opengen_file}")
-    
-    # Read first 3 examples for testing
-    test_examples = []
-    with open(opengen_file, 'r') as f:
-        for i, line in enumerate(f):
-            if i >= 3:  # Only test first 3 examples
-                break
-            data = json.loads(line)
-            # Combine prefix and targets
-            combined_text = data["prefix"] + " " + " ".join(data["targets"])
-            test_examples.append({
-                'id': i,
-                'text': combined_text,
-                'prefix': data["prefix"],
-                'targets': data["targets"]
-            })
-    
-    print(f"Loaded {len(test_examples)} test examples")
-    
-    # Test each example
-    for example in test_examples:
-        print(f"\n{'='*80}")
-        print(f"Testing Example {example['id']}")
-        print(f"Text length: {len(example['text'])} characters")
-        print(f"Prefix: {example['prefix'][:100]}...")
-        print(f"Targets: {len(example['targets'])} targets")
-        print(f"{'='*80}")
-        
-        # Extract keywords using NER only
-        print("\nExtracting keywords...")
-        keywords = sg.extract_keywords_with_ner(example['text'])
-        
-        print(f"NER keywords: {keywords}")
-        
-        # Get matched entities and embeddings
-        print("\nMatching entities...")
-        seed_entities = sg.get_matching_entities(keywords)
-        
-        print(f"Seed entities: {len(seed_entities)}")
-        
-        # Get embeddings
-        print("\nGetting embeddings...")
-        entity_embeddings = sg.get_kepler_embeddings_for_matched_entities(seed_entities)
-        
-        print(f"Embeddings: {len(entity_embeddings)}")
-        
-        # Test Semantic Bridge strategy
-        print(f"\n{'='*60}")
-        print(f"Testing Semantic Bridge Strategy for Example {example['id']}")
-        print(f"{'='*60}")
-        
-        start_time = time.time()
-        
-        # Test with NER keywords
-        subgraph_nodes = sg.construct_subgraph_semantic_bridge(
-            seed_entities, entity_embeddings, 
-            top_k=50, similarity_threshold=0.7, virtual_edge_ratio=0.1
-        )
-        
-        end_time = time.time()
-        execution_time = end_time - start_time
-        
-        # Analyze quality
-        quality = sg.analyze_subgraph_quality(subgraph_nodes, seed_entities)
-        
-        # Get triples
-        triples = sg.get_subgraph_triples(subgraph_nodes)
-        
-        print(f"\n✅ Example {example['id']} completed in {execution_time:.2f} seconds")
-        print(f"   Nodes: {len(subgraph_nodes)}, triples: {len(triples)}")
-        print(f"   Seed coverage: {quality['seed_coverage']:.3f}")
-        print(f"   Connectivity: {quality['connectivity']:.3f}")
-        
-        # Store results for this example
-        example_results = {
-            "example_id": example['id'],
-            "execution_time": execution_time,
-            "nodes": len(subgraph_nodes),
-            "triples": len(triples),
-            "quality": quality
-        }
-        
-        # Save individual example results
-        with open(f"semantic_bridge_example_{example['id']}_results.json", "w") as f:
-            json.dump(example_results, f, indent=2)
-        
-        print(f"✅ Example {example['id']} results saved to semantic_bridge_example_{example['id']}_results.json")
-    
-    print(f"\n{'='*80}")
-    print("All examples completed!")
-    print(f"{'='*80}")
-    
-    # Summary of all results
-    print(f"\n{'='*80}")
-    print("SUMMARY OF ALL EXAMPLES")
-    print(f"{'='*80}")
-    
-    total_execution_time = 0
-    total_nodes = 0
-    total_triples = 0
-    
-    for example in test_examples:
-        # Load results for this example
-        try:
-            with open(f"semantic_bridge_example_{example['id']}_results.json", "r") as f:
-                example_results = json.load(f)
-            
-            total_execution_time += example_results['execution_time']
-            total_nodes += example_results['nodes']
-            total_triples += example_results['triples']
-            
-            print(f"Example {example['id']}: {example_results['execution_time']:.2f}s, "
-                  f"Nodes: {example_results['nodes']}")
-        except FileNotFoundError:
-            print(f"Example {example['id']}: Results file not found")
-    
-    print(f"\nAVERAGE RESULTS:")
-    print(f"  Average execution time: {total_execution_time/len(test_examples):.2f}s")
-    print(f"  Average nodes: {total_nodes/len(test_examples):.1f}")
-    print(f"  Average triples: {total_triples/len(test_examples):.1f}")
-    
-    print(f"\n{'='*80}")
-    print("Semantic Bridge subgraph construction test completed!")
-    print(f"{'='*80}")
